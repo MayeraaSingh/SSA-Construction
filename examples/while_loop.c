@@ -1,1 +1,7 @@
-/* Example program: while loop with back edge. */
+x = 0;
+
+while (x < 5) {
+    x = x + 1;
+}
+
+y = x;

@@ -63,4 +63,6 @@ ssa-construction/
 
 ## Development Status
 
-**Initial scaffolding completed; implementation not yet started.**
+**Day 1 complete** — frontend (lexer, parser, AST) and CFG construction
+implemented and tested. SSA construction (variable renaming, phi functions,
+sealed-block handling) is not yet started.

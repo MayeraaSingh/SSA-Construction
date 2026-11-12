@@ -1,1 +1,3 @@
-/* Example program: sequential assignment statements. */
+x = 10;
+y = x + 5;
+z = x * y - 2;
