@@ -1,0 +1,55 @@
+# Python bytecode and __pycache__
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+
+# Distribution / packaging
+build/
+dist/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editor configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vs/
+
+# pytest and coverage caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Generated visualization files
+results/*.png
+results/*.jpg
+results/*.jpeg
+results/*.pdf
+results/*.svg
+results/*.dot
+
+# Temporary files and OS metadata
+*.tmp
+*.log
+*.bak
+*.cache
+Thumbs.db
+desktop.ini
+.DS_Store
