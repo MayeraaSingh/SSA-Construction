@@ -1,8 +1,7 @@
 """Command-line entry point for the SSA construction tool.
 
-Drives the pipeline from source parsing through CFG construction.  For Day 1
-the pipeline stops after CFG construction and textual output — SSA conversion
-is not yet implemented.
+Drives the full pipeline: source → lexer → parser → AST → CFG → SSA
+construction → SSA output → SSA validation.
 
 Usage::
 
@@ -19,10 +18,11 @@ from src.frontend.lexer import LexError, Lexer
 from src.frontend.parser import ParseError, Parser
 from src.ir.cfg_builder import CFGBuilder
 from src.ir.control_flow_graph import CFGError
+from src.ssa.ssa_builder import SSAError, SSABuilder
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the full Day 1 pipeline on a single source file.
+    """Run the full pipeline on a single source file.
 
     Args:
         argv: Command-line arguments (excluding the program name).  If
@@ -63,27 +63,52 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # 5. Print AST
-    print("=== AST ===")
+    print("========== ABSTRACT SYNTAX TREE ==========")
+    print()
     print(pretty_print(ast))
     print()
 
-    # 6. Build CFG
+    # 6. Build and print original CFG (Day 1)
     try:
         cfg = CFGBuilder().build(ast)
     except CFGError as exc:
         print(f"CFG construction error: {exc}")
         return 1
 
-    # 7. Validate CFG
-    errors = cfg.validate()
-    if errors:
+    cfg_errors = cfg.validate()
+    if cfg_errors:
         print("CFG validation failed:")
-        for err in errors:
+        for err in cfg_errors:
             print(f"  - {err}")
         return 1
 
-    # 8. Print CFG
+    print("========== ORIGINAL CONTROL FLOW GRAPH ==========")
+    print()
     print(cfg.to_text())
+
+    # 7. Build SSA
+    try:
+        ssa_builder = SSABuilder()
+        ssa_cfg = ssa_builder.build(ast)
+    except SSAError as exc:
+        print(f"SSA construction error: {exc}")
+        return 1
+
+    # 8. Print SSA IR
+    print("========== SSA INTERMEDIATE REPRESENTATION ==========")
+    print()
+    print(ssa_builder.to_ssa_text())
+
+    # 9. Validate SSA
+    print("========== SSA VALIDATION ==========")
+    print()
+    ssa_errors = ssa_builder.validate_ssa()
+    if ssa_errors:
+        print("SSA validation failed:")
+        for err in ssa_errors:
+            print(f"  - {err}")
+        return 1
+    print("SSA validation successful.")
 
     return 0
 

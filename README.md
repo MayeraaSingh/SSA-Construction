@@ -63,6 +63,7 @@ ssa-construction/
 
 ## Development Status
 
-**Day 1 complete** — frontend (lexer, parser, AST) and CFG construction
-implemented and tested. SSA construction (variable renaming, phi functions,
-sealed-block handling) is not yet started.
+**Day 2 complete** — lazy SSA construction using the sealed-block algorithm is
+implemented and tested.  The pipeline now produces SSA-form IR with phi
+functions, incomplete-phi resolution for loop headers, and trivial-phi
+elimination.  All 136 tests pass (86 Day 1 + 50 Day 2).
