@@ -62,4 +62,4 @@ class PhiFunction:
         ops = ", ".join(
             f"{value} [B{pred}]" for pred, value in self.operands.items()
         )
-        return f"{self.result} = \u03c6({ops})"
+        return f"{self.result} = phi({ops})"

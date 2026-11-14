@@ -176,6 +176,7 @@ class SSABuilder:
         self._counters: dict[str, int] = {}
         self._aliases: dict[str, str] = {}
         self._definitions: set[str] = set()
+        self._ssa_to_var: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Variable version management
@@ -190,7 +191,13 @@ class SSABuilder:
         self._counters[name] = count
         ssa_name = f"{name}_{count}"
         self._definitions.add(ssa_name)
+        self._ssa_to_var[ssa_name] = name
         return ssa_name
+
+    @property
+    def ssa_to_source_var(self) -> dict[str, str]:
+        """Mapping from SSA value name to the source variable it represents."""
+        return self._ssa_to_var
 
     # ------------------------------------------------------------------
     # Core read / write operations
@@ -598,7 +605,7 @@ class SSABuilder:
                         f"{self._resolve_alias(v)} [B{k}]"
                         for k, v in phi.operands.items()
                     )
-                    lines.append(f"  {phi.result} = \u03c6({ops})")
+                    lines.append(f"  {phi.result} = phi({ops})")
                     has_content = True
 
             # Render SSA instructions.
@@ -647,19 +654,52 @@ class SSABuilder:
         Returns:
             A list of human-readable error messages.  An empty list means
             the SSA is valid.
+
+        Checks performed:
+
+        1.  Every assignment result and non-eliminated phi result is unique.
+        2.  Every SSA value use resolves (through aliases) to a valid definition.
+        3.  Every non-eliminated phi has exactly one operand per predecessor.
+        4.  Phi operand block IDs are valid predecessors of the phi's block.
+        5.  No incomplete (empty-operand) phis remain in sealed blocks.
+        6.  No eliminated phi result is directly referenced in a non-eliminated
+            phi's operands (must be resolved through aliases).
+        7.  All alias targets resolve to defined values.
+        8.  All blocks are sealed.
+        9.  Phi ``block_id`` matches the block storing it.
+        10. All branch conditions use valid SSA values.
         """
         errors: list[str] = []
 
         # Collect all defined SSA values (from assignments and non-eliminated phis).
         defined: set[str] = set()
+        all_results: list[str] = []
         for block in self._cfg.blocks.values():
             for inst in block.ssa_instructions:
                 if isinstance(inst, SSAAssignment):
                     defined.add(inst.result)
+                    all_results.append(inst.result)
             for phi in block.phis:
                 if not phi.eliminated:
                     defined.add(phi.result)
-        # Eliminated phi results are aliased — their targets must be defined.
+                    all_results.append(phi.result)
+
+        # 1. Check uniqueness of all definitions.
+        if len(all_results) != len(set(all_results)):
+            seen: set[str] = set()
+            for r in all_results:
+                if r in seen:
+                    errors.append(f"duplicate SSA definition: {r}")
+                seen.add(r)
+
+        # Collect eliminated phi results for reference-leak detection.
+        eliminated_results: set[str] = set()
+        for block in self._cfg.blocks.values():
+            for phi in block.phis:
+                if phi.eliminated:
+                    eliminated_results.add(phi.result)
+
+        # 7. Eliminated phi results are aliased — their targets must be defined.
         for alias, target in self._aliases.items():
             resolved = self._resolve_alias(target)
             if resolved not in defined:
@@ -681,14 +721,16 @@ class SSABuilder:
                         resolved = self._resolve_alias(u)
                         if resolved not in defined:
                             errors.append(
-                                f"block {bid}: use of undefined SSA value {u}"
+                                f"block {bid}: use of undefined SSA value '{u}' "
+                                f"(resolved to '{resolved}')"
                             )
                 elif isinstance(inst, SSAConditionalBranch):
                     for u in self._collect_uses(inst.condition):
                         resolved = self._resolve_alias(u)
                         if resolved not in defined:
                             errors.append(
-                                f"block {bid}: branch uses undefined SSA value {u}"
+                                f"block {bid}: branch condition uses undefined "
+                                f"SSA value '{u}' (resolved to '{resolved}')"
                             )
 
             # Check phi functions.
@@ -696,33 +738,49 @@ class SSABuilder:
                 if phi.eliminated:
                     continue
 
+                # 9. Phi block_id must match the block storing it.
+                if phi.block_id != bid:
+                    errors.append(
+                        f"phi {phi.result} has block_id {phi.block_id} "
+                        f"but is stored in block {bid}"
+                    )
+
                 # 3. One operand per predecessor.
                 if len(phi.operands) != len(block.predecessors):
                     errors.append(
-                        f"block {bid}: phi {phi.result} has {len(phi.operands)} "
-                        f"operands but {len(block.predecessors)} predecessors"
+                        f"block {bid}: phi {phi.result} (variable '{phi.variable}') "
+                        f"has {len(phi.operands)} operands but "
+                        f"{len(block.predecessors)} predecessors"
                     )
 
                 # 4. Operand block IDs must be valid predecessors.
                 for pred_id in phi.operands:
                     if pred_id not in block.predecessors:
                         errors.append(
-                            f"block {bid}: phi {phi.result} has operand from "
-                            f"non-predecessor block {pred_id}"
+                            f"block {bid}: phi {phi.result} (variable '{phi.variable}') "
+                            f"has operand from non-predecessor block {pred_id}"
                         )
 
                 # 5. No incomplete phis.
                 if len(phi.operands) == 0:
                     errors.append(
-                        f"block {bid}: phi {phi.result} is incomplete (no operands)"
+                        f"block {bid}: phi {phi.result} (variable '{phi.variable}') "
+                        f"is incomplete (no operands)"
                     )
 
-                # Check that operands are defined.
-                for operand in phi.operands.values():
+                # 6. No eliminated phi result should appear directly in operands.
+                for pred_id, operand in phi.operands.items():
+                    if operand in eliminated_results:
+                        errors.append(
+                            f"block {bid}: phi {phi.result} (variable '{phi.variable}') "
+                            f"references eliminated phi '{operand}' from B{pred_id} "
+                            f"without alias resolution"
+                        )
                     resolved = self._resolve_alias(operand)
                     if resolved not in defined:
                         errors.append(
-                            f"block {bid}: phi {phi.result} uses undefined value {operand}"
+                            f"block {bid}: phi {phi.result} (variable '{phi.variable}') "
+                            f"uses undefined value '{operand}' from B{pred_id}"
                         )
 
         return errors
