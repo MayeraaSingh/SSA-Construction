@@ -17,6 +17,7 @@ from src.ssa.ssa_builder import SSABuilder
 from src.visualization.cfg_visualizer import (
     VisualizationError,
     _VIZ_AVAILABLE,
+    get_backedges,
     visualize_cfg,
     visualize_ssa,
 )
@@ -223,3 +224,117 @@ class TestAllExamples:
             stem = example_file.stem
             assert visualize_cfg(cfg, tmp_path / f"{stem}_cfg.png").exists()
             assert visualize_ssa(builder, tmp_path / f"{stem}_ssa.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Backedge detection regression tests (always run, no viz dependency needed)
+# ---------------------------------------------------------------------------
+
+
+# These tests do NOT require matplotlib; they test the graph-algorithm only.
+class TestBackedgeDetection:
+    """Verify that get_backedges() uses DFS classification, not block-ID order."""
+
+    # ------------------------------------------------------------------ #
+    # Genuine loop backedge
+    # ------------------------------------------------------------------ #
+
+    def test_while_loop_has_one_backedge(self):
+        """while_loop: B2 -> B1 is the only backedge."""
+        source = "x = 0;\nwhile (x < 5) { x = x + 1; }\ny = x;"
+        cfg = build_cfg(source)
+        be = get_backedges(cfg)
+        # Find the header (the block with two predecessors — entry and body).
+        header = next(
+            b for b in cfg.blocks.values() if len(b.predecessors) == 2
+        )
+        body = next(
+            b for b in cfg.blocks.values()
+            if header.block_id in b.successors and b.block_id != cfg.entry_block.block_id
+            and b.block_id in header.successors
+        )
+        assert (body.block_id, header.block_id) in be
+        assert len(be) == 1
+
+    def test_while_loop_backedge_is_body_to_header(self):
+        source = "x = 0;\nwhile (x < 5) { x = x + 1; }\ny = x;"
+        cfg = build_cfg(source)
+        be = get_backedges(cfg)
+        # Explicitly: B2 -> B1
+        assert (2, 1) in be
+
+    # ------------------------------------------------------------------ #
+    # Forward edge to lower-numbered block (must NOT be a backedge)
+    # ------------------------------------------------------------------ #
+
+    def test_nested_if_inner_merge_to_outer_merge_is_not_backedge(self):
+        """nested_if: B6 -> B3 is a forward merge edge, not a backedge."""
+        source = open(
+            Path(__file__).parent.parent / "examples" / "nested_if.c"
+        ).read()
+        cfg = build_cfg(source)
+        be = get_backedges(cfg)
+        assert (6, 3) not in be
+
+    def test_nested_if_has_no_backedges(self):
+        """nested_if has no loops at all — zero backedges expected."""
+        source = open(
+            Path(__file__).parent.parent / "examples" / "nested_if.c"
+        ).read()
+        cfg = build_cfg(source)
+        be = get_backedges(cfg)
+        assert len(be) == 0
+
+    # ------------------------------------------------------------------ #
+    # Conditional-only CFG (no loops anywhere)
+    # ------------------------------------------------------------------ #
+
+    def test_conditional_no_backedges(self):
+        source = "x = 10;\nif (x > 5) { y = 20; } else { y = 30; }\nz = y + 5;"
+        cfg = build_cfg(source)
+        assert get_backedges(cfg) == set()
+
+    def test_straight_line_no_backedges(self):
+        cfg = build_cfg("x = 1;\ny = 2;\nz = 3;")
+        assert get_backedges(cfg) == set()
+
+    # ------------------------------------------------------------------ #
+    # Nested loops
+    # ------------------------------------------------------------------ #
+
+    def test_nested_loops_two_backedges(self):
+        """Two nested while loops should produce exactly two backedges."""
+        source = """x = 0;
+y = 0;
+while (x < 3) {
+    y = 0;
+    while (y < 2) {
+        y = y + 1;
+    }
+    x = x + 1;
+}
+z = x;"""
+        cfg = build_cfg(source)
+        be = get_backedges(cfg)
+        assert len(be) == 2
+
+    def test_loop_with_if_else_one_backedge(self):
+        """A loop containing an if-else has exactly one backedge."""
+        source = """x = 0;
+y = 0;
+while (x < 10) {
+    if (x > 5) { y = y + 10; } else { y = y + 1; }
+    x = x + 1;
+}
+result = y;"""
+        cfg = build_cfg(source)
+        be = get_backedges(cfg)
+        assert len(be) == 1
+
+    # ------------------------------------------------------------------ #
+    # Empty program
+    # ------------------------------------------------------------------ #
+
+    def test_empty_program_no_backedges(self):
+        cfg = build_cfg("")
+        assert get_backedges(cfg) == set()

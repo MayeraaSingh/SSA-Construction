@@ -18,7 +18,6 @@ Usage::
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from src.ir.basic_block import BasicBlock, TerminationType
 from src.ir.control_flow_graph import ControlFlowGraph
@@ -34,9 +33,9 @@ from src.ir.instructions import (
 
 try:
     import matplotlib
-
     matplotlib.use("Agg")  # Non-interactive backend for file output.
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
     import networkx as nx
 
     _VIZ_AVAILABLE = True
@@ -45,9 +44,8 @@ except ImportError as exc:
     _VIZ_AVAILABLE = False
     _VIZ_ERROR = str(exc)
 
-
 # ---------------------------------------------------------------------------
-# SSA type imports (deferred to avoid import cost when viz is unused)
+# SSA type imports
 # ---------------------------------------------------------------------------
 
 from src.ssa.ssa_builder import (
@@ -88,12 +86,11 @@ def visualize_cfg(
     """
     _check_deps()
     graph = _build_graph(cfg)
-    pos = _compute_layout(cfg)
+    pos = _compute_layout(cfg, graph)
     node_labels = {bid: _format_cfg_label(cfg.get_block(bid)) for bid in cfg.blocks}
     edge_labels = _get_cfg_edge_labels(cfg)
     node_colors = _get_node_colors(cfg)
-    backedges = _get_backedges(cfg)
-
+    backedges = get_backedges(cfg)
     return _render(
         graph, pos, node_labels, edge_labels, node_colors, backedges,
         output_path, title, cfg,
@@ -123,14 +120,13 @@ def visualize_ssa(
     _check_deps()
     cfg = builder._cfg
     graph = _build_graph(cfg)
-    pos = _compute_layout(cfg)
+    pos = _compute_layout(cfg, graph)
     node_labels = {
         bid: _format_ssa_label(cfg.get_block(bid), builder) for bid in cfg.blocks
     }
     edge_labels = _get_ssa_edge_labels(builder)
     node_colors = _get_node_colors(cfg)
-    backedges = _get_backedges(cfg)
-
+    backedges = get_backedges(cfg)
     return _render(
         graph, pos, node_labels, edge_labels, node_colors, backedges,
         output_path, title, cfg,
@@ -152,6 +148,46 @@ def _check_deps() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backedge detection — DFS-based (correct)
+# ---------------------------------------------------------------------------
+
+
+def get_backedges(cfg: ControlFlowGraph) -> set[tuple[int, int]]:
+    """Identify true loop backedges using DFS grey-node classification.
+
+    An edge u -> v is a backedge when v is an *ancestor* of u in the DFS
+    tree, i.e. v is currently on the DFS stack (grey) when the edge is
+    first encountered.  This is the standard algorithm-textbook definition
+    and is correct for any directed graph — it does not rely on block IDs.
+
+    Returns:
+        A set of (src_id, dst_id) pairs that are genuine backedges.
+    """
+    if cfg.entry_block is None:
+        return set()
+
+    backedges: set[tuple[int, int]] = set()
+    # DFS colouring: white (unvisited), grey (on stack), black (done).
+    WHITE, GREY, BLACK = 0, 1, 2
+    color: dict[int, int] = {bid: WHITE for bid in cfg.blocks}
+
+    def dfs(u: int) -> None:
+        color[u] = GREY
+        block = cfg.blocks[u]
+        for v in block.successors:
+            if v not in color:
+                continue  # Safety: ignore edges to blocks not in CFG.
+            if color[v] == GREY:
+                backedges.add((u, v))   # Back edge: v is an ancestor.
+            elif color[v] == WHITE:
+                dfs(v)
+        color[u] = BLACK
+
+    dfs(cfg.entry_block.block_id)
+    return backedges
+
+
+# ---------------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------------
 
@@ -168,93 +204,91 @@ def _build_graph(cfg: ControlFlowGraph) -> "nx.DiGraph":
 
 
 # ---------------------------------------------------------------------------
-# Layout
+# Layout — layered BFS, skipping backedges
 # ---------------------------------------------------------------------------
 
 
-def _compute_layout(cfg: ControlFlowGraph) -> dict[int, tuple[float, float]]:
-    """Compute node positions using a layered (top-down) layout.
+def _compute_layout(
+    cfg: ControlFlowGraph,
+    graph: "nx.DiGraph",
+) -> dict[int, tuple[float, float]]:
+    """Compute node positions using a top-down layered layout.
 
-    Depth is the shortest path from the entry block (BFS).  Blocks at the
-    same depth are spread horizontally.  Backedges are ignored when
-    computing depth so loop headers appear above loop bodies.
+    Depth (layer) is computed by BFS from the entry block following only
+    forward edges (backedges excluded so loop headers sit above their bodies).
+    Blocks at the same depth are spread horizontally with enough spacing
+    to accommodate their label widths.
     """
-    entry_id = cfg.entry_block.block_id if cfg.entry_block else 0
+    if not cfg.blocks:
+        return {}
 
-    # BFS to compute depths (ignores backedges naturally — each node visited once).
+    entry_id = cfg.entry_block.block_id if cfg.entry_block else min(cfg.blocks)
+    backedges = get_backedges(cfg)
+
+    # BFS over non-backedge edges to assign depths.
     depths: dict[int, int] = {entry_id: 0}
     queue: list[int] = [entry_id]
     while queue:
         current = queue.pop(0)
-        block = cfg.get_block(current)
+        block = cfg.blocks[current]
         for succ_id in block.successors:
-            if succ_id not in depths:
+            if (current, succ_id) not in backedges and succ_id not in depths:
                 depths[succ_id] = depths[current] + 1
                 queue.append(succ_id)
 
-    # Ensure every block has a depth (in case some aren't reachable).
+    # Assign unreachable blocks to a layer below everything.
+    max_known = max(depths.values(), default=0)
     for bid in cfg.blocks:
         if bid not in depths:
-            depths[bid] = max(depths.values(), default=0) + 1
+            depths[bid] = max_known + 1
 
     # Group blocks by depth.
-    max_depth = max(depths.values()) if depths else 0
+    max_depth = max(depths.values(), default=0)
     layers: list[list[int]] = [[] for _ in range(max_depth + 1)]
     for bid, d in depths.items():
         layers[d].append(bid)
 
-    # Assign positions.
+    # Horizontal spacing: at least 4.0 units between block centres.
+    H_GAP = 4.0
+    # Vertical spacing: 3.5 units between layers.
+    V_GAP = 3.5
+
     pos: dict[int, tuple[float, float]] = {}
     for d, layer in enumerate(layers):
         n = len(layer)
         for i, bid in enumerate(sorted(layer)):
-            x = (i - (n - 1) / 2) * 3.5
-            y = -d * 3.0
+            x = (i - (n - 1) / 2.0) * H_GAP
+            y = -d * V_GAP
             pos[bid] = (x, y)
 
     return pos
 
 
 # ---------------------------------------------------------------------------
-# Edge labels and styling
+# Edge labels
 # ---------------------------------------------------------------------------
 
 
 def _get_cfg_edge_labels(cfg: ControlFlowGraph) -> dict[tuple[int, int], str]:
-    """Map edges to 'True'/'False' labels for conditional branches."""
+    """Return True/False labels for conditional branch edges (pre-SSA CFG)."""
     labels: dict[tuple[int, int], str] = {}
     for block in cfg.blocks.values():
         for inst in block.instructions:
             if isinstance(inst, ConditionalBranchInstruction):
-                labels[(block.block_id, inst.true_dest)] = "True"
-                labels[(block.block_id, inst.false_dest)] = "False"
+                labels[(block.block_id, inst.true_dest)] = "T"
+                labels[(block.block_id, inst.false_dest)] = "F"
     return labels
 
 
 def _get_ssa_edge_labels(builder: SSABuilder) -> dict[tuple[int, int], str]:
-    """Map SSA-form edges to 'True'/'False' labels."""
+    """Return True/False labels for conditional branch edges (SSA CFG)."""
     labels: dict[tuple[int, int], str] = {}
     for block in builder._cfg.blocks.values():
         for inst in block.ssa_instructions:
             if isinstance(inst, SSAConditionalBranch):
-                labels[(block.block_id, inst.true_dest)] = "True"
-                labels[(block.block_id, inst.false_dest)] = "False"
+                labels[(block.block_id, inst.true_dest)] = "T"
+                labels[(block.block_id, inst.false_dest)] = "F"
     return labels
-
-
-def _get_backedges(cfg: ControlFlowGraph) -> set[tuple[int, int]]:
-    """Identify backedges using the heuristic dst_id < src_id.
-
-    For structured CFGs produced by our builder, loop headers always have
-    smaller block IDs than their bodies, so this correctly identifies
-    backedges without computing dominators.
-    """
-    backedges: set[tuple[int, int]] = set()
-    for block in cfg.blocks.values():
-        for succ_id in block.successors:
-            if succ_id < block.block_id:
-                backedges.add((block.block_id, succ_id))
-    return backedges
 
 
 # ---------------------------------------------------------------------------
@@ -263,15 +297,15 @@ def _get_backedges(cfg: ControlFlowGraph) -> set[tuple[int, int]]:
 
 
 def _get_node_colors(cfg: ControlFlowGraph) -> dict[int, str]:
-    """Assign colors to blocks: entry=green, exit=coral, normal=lightblue."""
+    """Entry=green, exit=coral, everything else=light blue."""
     colors: dict[int, str] = {}
     for bid in cfg.blocks:
         if cfg.entry_block is not None and bid == cfg.entry_block.block_id:
-            colors[bid] = "#90EE90"  # light green
+            colors[bid] = "#90EE90"   # light green
         elif cfg.exit_block is not None and bid == cfg.exit_block.block_id:
-            colors[bid] = "#F08080"  # light coral
+            colors[bid] = "#F08080"   # light coral
         else:
-            colors[bid] = "#ADD8E6"  # light blue
+            colors[bid] = "#ADD8E6"   # light blue
     return colors
 
 
@@ -279,54 +313,91 @@ def _get_node_colors(cfg: ControlFlowGraph) -> dict[int, str]:
 # Label formatting
 # ---------------------------------------------------------------------------
 
+# Maximum characters per line before wrapping long instruction text.
+_MAX_LINE = 32
+
+
+def _truncate(text: str, limit: int = _MAX_LINE) -> str:
+    """Hard-truncate *text* with an ellipsis if it exceeds *limit* chars."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
 
 def _format_cfg_label(block: BasicBlock) -> str:
-    """Format a block's Day 1 IR instructions as a multiline label."""
-    lines = [f"Block {block.block_id}"]
+    """Format a pre-SSA block as a compact multiline label."""
+    lines = [f"── Block {block.block_id} ──"]
     if not block.instructions:
         lines.append("(empty)")
     for inst in block.instructions:
         if isinstance(inst, AssignmentInstruction):
-            lines.append(f"{inst.target} = {inst.expr}")
+            lines.append(_truncate(f"{inst.target} = {inst.expr}"))
         elif isinstance(inst, ConditionalBranchInstruction):
-            lines.append(f"if {inst.condition} -> B{inst.true_dest} else -> B{inst.false_dest}")
+            lines.append(_truncate(f"if {inst.condition}"))
+            lines.append(f"  T→B{inst.true_dest}  F→B{inst.false_dest}")
         elif isinstance(inst, UnconditionalJumpInstruction):
-            lines.append(f"jump -> B{inst.dest}")
+            lines.append(f"→ B{inst.dest}")
         else:
-            lines.append(str(inst))
+            lines.append(_truncate(str(inst)))
     return "\n".join(lines)
 
 
 def _format_ssa_label(block: BasicBlock, builder: SSABuilder) -> str:
-    """Format a block's SSA instructions and phi functions as a multiline label."""
-    lines = [f"Block {block.block_id}"]
+    """Format an SSA block as a compact multiline label.
 
-    # Phi functions first.
+    Phi functions appear first (before other instructions).
+    """
+    lines = [f"── Block {block.block_id} ──"]
+
     for phi in block.phis:
         if not phi.eliminated:
             ops = ", ".join(
-                f"{builder._resolve_alias(v)} [B{k}]"
+                f"{builder._resolve_alias(v)}[B{k}]"
                 for k, v in phi.operands.items()
             )
-            lines.append(f"{phi.result} = phi({ops})")
+            lines.append(_truncate(f"φ {phi.result}=({ops})"))
 
-    # SSA instructions.
-    if not block.ssa_instructions and not any(not p.eliminated for p in block.phis):
+    has_content = any(not p.eliminated for p in block.phis)
+    if not block.ssa_instructions and not has_content:
         lines.append("(empty)")
+
     for inst in block.ssa_instructions:
         if isinstance(inst, SSAAssignment):
-            lines.append(f"{inst.result} = {builder._render_ssa_expr(inst.expr)}")
+            lines.append(_truncate(
+                f"{inst.result} = {builder._render_ssa_expr(inst.expr)}"
+            ))
         elif isinstance(inst, SSAConditionalBranch):
-            lines.append(
+            lines.append(_truncate(
                 f"if {builder._render_ssa_expr(inst.condition)}"
-                f" -> B{inst.true_dest} else -> B{inst.false_dest}"
-            )
+            ))
+            lines.append(f"  T→B{inst.true_dest}  F→B{inst.false_dest}")
         elif isinstance(inst, SSAUnconditionalJump):
-            lines.append(f"jump -> B{inst.dest}")
+            lines.append(f"→ B{inst.dest}")
         else:
-            lines.append(str(inst))
+            lines.append(_truncate(str(inst)))
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Node size helpers
+# ---------------------------------------------------------------------------
+
+
+def _label_dimensions(label: str) -> tuple[int, int]:
+    """Return (max_chars_per_line, num_lines) for a multiline label string."""
+    lines = label.split("\n")
+    return max(len(l) for l in lines), len(lines)
+
+
+def _node_size_for_label(label: str, chars_per_pt: float = 7.5) -> float:
+    """Estimate a square node area (pts²) large enough for *label*.
+
+    The heuristic converts max line width in characters to a node edge
+    length in points (at ~7.5 chars per pt at font_size=7) and squares it.
+    A minimum size prevents trivially small nodes.
+    """
+    max_chars, num_lines = _label_dimensions(label)
+    side = max(max_chars * chars_per_pt, num_lines * 14, 60)
+    return side * side
 
 
 # ---------------------------------------------------------------------------
@@ -345,88 +416,189 @@ def _render(
     title: str,
     cfg: ControlFlowGraph,
 ) -> Path:
-    """Render the graph to a PNG file using Matplotlib."""
+    """Render the graph to a PNG file and return its path."""
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Scale figure size based on graph complexity.
-    n_blocks = len(cfg.blocks)
-    max_layer = max(len(layer) for layer in _group_by_depth(pos)) if pos else 1
-    fig_width = max(10, min(24, max_layer * 4))
-    fig_height = max(8, min(20, n_blocks * 1.2))
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    if not pos:
+        # Empty graph — produce a minimal blank figure.
+        fig, ax = plt.subplots(figsize=(4, 3))
+        ax.set_title(title, fontsize=12)
+        ax.axis("off")
+        fig.savefig(str(output), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return output
 
-    color_list = [node_colors.get(bid, "#ADD8E6") for bid in sorted(cfg.blocks)]
+    # ------------------------------------------------------------------ #
+    # Figure sizing                                                        #
+    # ------------------------------------------------------------------ #
+    layers = _group_by_layer(pos)
+    max_width = max(len(layer) for layer in layers) if layers else 1
+    n_layers = len(layers)
 
-    # Draw nodes.
+    # Minimum 3 inches per horizontal block column, 2.5 inches per layer row.
+    fig_w = max(8.0, min(28.0, max_width * 3.2))
+    fig_h = max(6.0, min(24.0, n_layers * 2.5 + 2.0))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    # ------------------------------------------------------------------ #
+    # Per-node sizes (dynamic, proportional to label content)             #
+    # ------------------------------------------------------------------ #
+    node_sizes = [
+        _node_size_for_label(node_labels.get(bid, ""))
+        for bid in sorted(cfg.blocks)
+    ]
+
+    color_list = [
+        node_colors.get(bid, "#ADD8E6") for bid in sorted(cfg.blocks)
+    ]
+
+    # ------------------------------------------------------------------ #
+    # Expand axis limits so nodes are never clipped by the data boundary  #
+    #                                                                      #
+    # NetworkX draws node squares in display-points; the positions are in #
+    # data coordinates.  When both nodes share x=0 (single-column graph), #
+    # Matplotlib's auto-limit sets xlim ≈ (-0.5, 0.5), which is far too  #
+    # narrow for 100+ pt node squares.  We compute the largest half-side  #
+    # in data units and pad all four sides of the axis explicitly.        #
+    # ------------------------------------------------------------------ #
+    xs = [x for x, _ in pos.values()]
+    ys = [y for _, y in pos.values()]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+
+    # Convert the largest node half-side from display-points to data units.
+    # The figure renderer isn't set up yet, but we can estimate:
+    #   data_range_x ≈ H_GAP * (max_width - 1) or at least H_GAP
+    #   data_range_y ≈ V_GAP * (n_layers - 1) or at least V_GAP
+    # We use a fixed padding in data units based on the gap constants.
+    H_GAP = 4.0
+    V_GAP = 3.5
+    x_pad = H_GAP * 0.75   # ~3 data units of horizontal margin each side
+    y_pad = V_GAP * 0.6    # ~2 data units of vertical margin each side
+
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
+    # ------------------------------------------------------------------ #
+    # Draw nodes                                                           #
+    # ------------------------------------------------------------------ #
     nx.draw_networkx_nodes(
-        graph, pos, node_color=color_list, node_size=3000,
-        node_shape="s", linewidths=1.5, ax=ax,
+        graph, pos,
+        nodelist=sorted(cfg.blocks),
+        node_color=color_list,
+        node_size=node_sizes,
+        node_shape="s",
+        linewidths=1.2,
+        ax=ax,
     )
 
-    # Draw normal edges.
-    normal_edges = [(u, v) for u, v in graph.edges() if (u, v) not in backedges]
+    # ------------------------------------------------------------------ #
+    # Draw edges                                                           #
+    # ------------------------------------------------------------------ #
+    normal_edges = [e for e in graph.edges() if e not in backedges]
     if normal_edges:
         nx.draw_networkx_edges(
-            graph, pos, edgelist=normal_edges,
-            edge_color="#333333", arrows=True, arrowsize=20,
-            connectionstyle="arc3,rad=0.1", ax=ax,
+            graph, pos,
+            edgelist=normal_edges,
+            edge_color="#444444",
+            arrows=True,
+            arrowsize=18,
+            arrowstyle="-|>",
+            connectionstyle="arc3,rad=0.08",
+            min_source_margin=22,
+            min_target_margin=22,
+            ax=ax,
         )
 
-    # Draw backedges with distinct style.
     if backedges:
         nx.draw_networkx_edges(
-            graph, pos, edgelist=list(backedges),
-            edge_color="#CC0000", arrows=True, arrowsize=20,
-            style="dashed", connectionstyle="arc3,rad=0.3", ax=ax,
+            graph, pos,
+            edgelist=list(backedges),
+            edge_color="#CC0000",
+            arrows=True,
+            arrowsize=18,
+            arrowstyle="-|>",
+            style="dashed",
+            connectionstyle="arc3,rad=0.45",
+            min_source_margin=22,
+            min_target_margin=22,
+            ax=ax,
         )
 
-    # Draw node labels.
+    # ------------------------------------------------------------------ #
+    # Draw node labels                                                     #
+    # ------------------------------------------------------------------ #
     nx.draw_networkx_labels(
-        graph, pos, labels=node_labels,
-        font_size=7, font_family="monospace", ax=ax,
+        graph, pos,
+        labels=node_labels,
+        font_size=7,
+        font_family="monospace",
+        ax=ax,
     )
 
-    # Draw edge labels (True/False).
-    if edge_labels:
-        # Offset edge labels slightly for readability.
-        edge_pos = {}
-        for (u, v), label in edge_labels.items():
-            if (u, v) in pos and (u, v) in graph.edges():
-                edge_pos[(u, v)] = label
+    # ------------------------------------------------------------------ #
+    # Draw edge labels (T / F only)                                        #
+    # ------------------------------------------------------------------ #
+    visible_edge_labels = {
+        (u, v): lbl
+        for (u, v), lbl in edge_labels.items()
+        if graph.has_edge(u, v) and (u, v) not in backedges
+    }
+    if visible_edge_labels:
         nx.draw_networkx_edge_labels(
-            graph, pos, edge_labels=edge_pos,
-            font_size=8, font_color="#0066CC", ax=ax,
+            graph, pos,
+            edge_labels=visible_edge_labels,
+            font_size=8,
+            font_color="#005599",
+            bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.7, ec="none"),
+            ax=ax,
         )
 
-    # Legend for backedges.
+    # ------------------------------------------------------------------ #
+    # Legend — anchored outside the axes so it never overlaps any node.   #
+    # ------------------------------------------------------------------ #
+    legend_handles = [
+        mpatches.Patch(facecolor="#90EE90", edgecolor="#555", label="Entry block"),
+        mpatches.Patch(facecolor="#F08080", edgecolor="#555", label="Exit block"),
+        mpatches.Patch(facecolor="#ADD8E6", edgecolor="#555", label="Basic block"),
+    ]
     if backedges:
-        ax.plot([], [], color="#CC0000", linestyle="dashed",
-                label="Backedge (loop)")
-        ax.legend(loc="upper right", fontsize=9)
+        legend_handles.append(
+            mpatches.Patch(facecolor="#CC0000", label="Backedge (loop)")
+        )
+    # Place the legend in the figure's bottom-right corner, outside the axes.
+    ax.legend(
+        handles=legend_handles,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),   # just right of the axes bounding box
+        borderaxespad=0,
+        fontsize=8,
+        framealpha=0.9,
+    )
 
-    ax.set_title(title, fontsize=14, fontweight="bold", pad=15)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
     ax.axis("off")
-    plt.tight_layout()
+    # Use tight_layout with rect so the legend (outside axes) is included.
+    plt.tight_layout(rect=[0, 0, 0.88, 1.0])
     fig.savefig(str(output), dpi=150, bbox_inches="tight")
     plt.close(fig)
-
     return output
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _group_by_depth(
-    pos: dict[int, tuple[float, float]]
+def _group_by_layer(
+    pos: dict[int, tuple[float, float]],
 ) -> list[list[int]]:
-    """Group node IDs by their y-coordinate (depth)."""
+    """Group node IDs by their y-coordinate (rounded to 2 dp)."""
     if not pos:
         return []
     by_y: dict[float, list[int]] = {}
     for bid, (_, y) in pos.items():
-        rounded = round(y, 2)
-        by_y.setdefault(rounded, []).append(bid)
+        key = round(y, 2)
+        by_y.setdefault(key, []).append(bid)
     return [by_y[k] for k in sorted(by_y, reverse=True)]
