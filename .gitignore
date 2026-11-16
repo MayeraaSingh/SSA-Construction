@@ -45,6 +45,9 @@ results/*.pdf
 results/*.svg
 results/*.dot
 
+# CLI output directory
+outputs/
+
 # Temporary files and OS metadata
 *.tmp
 *.log

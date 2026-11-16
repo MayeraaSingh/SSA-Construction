@@ -1,15 +1,21 @@
 """Command-line entry point for the SSA construction tool.
 
-Drives the full pipeline: source → lexer → parser → AST → CFG → SSA
-construction → SSA output → SSA validation.
+Drives the full pipeline: source -> lexer -> parser -> AST -> CFG -> SSA
+construction -> SSA output -> SSA validation, with optional graphical
+CFG/SSA visualization.
 
 Usage::
 
     python -m src.main <source-file>
+    python -m src.main <source-file> --visualize
+    python -m src.main <source-file> --visualize --output-dir outputs/
+    python -m src.main <source-file> --visualize --cfg-only
+    python -m src.main <source-file> --visualize --ssa-only
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -21,23 +27,41 @@ from src.ir.control_flow_graph import CFGError
 from src.ssa.ssa_builder import SSAError, SSABuilder
 
 
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        prog="python -m src.main",
+        description="SSA Construction Tool — lazy sealed-block algorithm",
+    )
+    parser.add_argument("source_file", help="Path to the source program file")
+    parser.add_argument(
+        "--visualize", "-v", action="store_true",
+        help="Generate graphical CFG and SSA CFG diagrams as PNG files",
+    )
+    parser.add_argument(
+        "--output-dir", "-o", default="outputs",
+        help="Directory for generated diagram files (default: outputs)",
+    )
+    parser.add_argument(
+        "--cfg-only", action="store_true",
+        help="With --visualize, generate only the original CFG diagram",
+    )
+    parser.add_argument(
+        "--ssa-only", action="store_true",
+        help="With --visualize, generate only the SSA CFG diagram",
+    )
+    return parser.parse_args(argv)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the full pipeline on a single source file.
-
-    Args:
-        argv: Command-line arguments (excluding the program name).  If
-            ``None``, ``sys.argv[1:]`` is used.
 
     Returns:
         Process exit code (0 on success, 1 on error).
     """
-    args = argv if argv is not None else sys.argv[1:]
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
 
-    if len(args) < 1:
-        print("Usage: python -m src.main <source-file>")
-        return 1
-
-    source_path = Path(args[0])
+    source_path = Path(args.source_file)
     if not source_path.exists():
         print(f"Error: file not found: {source_path}")
         return 1
@@ -89,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     # 7. Build SSA
     try:
         ssa_builder = SSABuilder()
-        ssa_cfg = ssa_builder.build(ast)
+        ssa_builder.build(ast)
     except SSAError as exc:
         print(f"SSA construction error: {exc}")
         return 1
@@ -110,7 +134,54 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print("SSA validation successful.")
 
+    # 10. Optional visualization
+    if args.visualize:
+        _generate_visualizations(
+            cfg, ssa_builder, source_path.stem, args.output_dir,
+            args.cfg_only, args.ssa_only,
+        )
+
     return 0
+
+
+def _generate_visualizations(
+    cfg,
+    ssa_builder,
+    stem: str,
+    output_dir: str,
+    cfg_only: bool,
+    ssa_only: bool,
+) -> None:
+    """Generate and save CFG/SSA diagram PNGs."""
+    from src.visualization.cfg_visualizer import (
+        VisualizationError,
+        visualize_cfg,
+        visualize_ssa,
+    )
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    if not ssa_only:
+        cfg_path = out / f"{stem}_cfg.png"
+        try:
+            visualize_cfg(cfg, cfg_path, title=f"Original CFG — {stem}")
+            print(f"  Saved: {cfg_path}")
+        except VisualizationError as exc:
+            print(f"  Visualization error (CFG): {exc}")
+
+    if not cfg_only:
+        ssa_path = out / f"{stem}_ssa.png"
+        try:
+            visualize_ssa(ssa_builder, ssa_path, title=f"SSA CFG — {stem}")
+            print(f"  Saved: {ssa_path}")
+        except VisualizationError as exc:
+            print(f"  Visualization error (SSA): {exc}")
+
+    print()
+    print("========== VISUALIZATION ==========")
+    print()
+    print(f"Diagrams saved to: {out.resolve()}")
 
 
 if __name__ == "__main__":
